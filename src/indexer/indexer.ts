@@ -683,7 +683,7 @@ export class CodeIndexer {
       return [0, 0];
     }
 
-    await _retryTransient(() => this.deleteFile(relPath), `deleteFile ${relPath}`);
+    await _retryTransient(() => this.untagFile(relPath, this._branch), `untagFile ${relPath}`);
 
     // ── Dep graph ────────────────────────────────────────────────────────────
     const rawImports      = chunks[0]?.imports ?? [];
