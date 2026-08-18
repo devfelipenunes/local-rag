@@ -22,6 +22,11 @@ const IGNORE_DIRS = new Set([
   "vendor", "charts", "testdata",
 ]);
 
+// Skip oversized files entirely — a single large blob (hex dumps, generated
+// bundles, serialized data) can produce thousands of chunks and stall the
+// indexer for hours on a CPU-only box. JSON keeps its own tighter cap.
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+
 /**
  * Retry a transient operation (typically a Qdrant HTTP call) with exponential
  * backoff. `fetch failed` from undici, DNS hiccups, and ECONNRESET resets
@@ -168,10 +173,13 @@ export class CodeIndexer {
     if (name.startsWith(".")) return true;
     if (!EXTENSIONS.has(ext)) return true;
 
-    // Safety check for file size (only if file exists)
-    if (ext === ".json" && existsSync(absPath)) {
+    // Safety check for file size (only if file exists). A cap prevents a
+    // single large blob from producing thousands of slow CPU embeddings.
+    if (existsSync(absPath)) {
       try {
-        if (statSync(absPath).size > 100_000) return true;
+        const size = statSync(absPath).size;
+        if (size > MAX_FILE_BYTES) return true;
+        if (ext === ".json" && size > 100_000) return true;
       } catch { /* ignore stat errors */ }
     }
 

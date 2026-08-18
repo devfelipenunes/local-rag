@@ -37,7 +37,7 @@ async function embedOllama(texts: string[], baseUrl: string, timeout: number): P
   const resp = await fetch(`${baseUrl}/api/embed`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: cfg.embedModel, input: texts }),
+    body: JSON.stringify({ model: cfg.embedModel, input: texts, truncate: true }),
     signal: AbortSignal.timeout(timeout),
   });
   if (!resp.ok) {
