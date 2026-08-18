@@ -107,9 +107,10 @@ function extractValidOps(parsed: unknown[]): RouterOp[] {
       process.stderr.write(`[router] dropped reasoning-leak: "${text.slice(0, 80)}"\n`);
       return [];
     }
-    const status = String(o["status"] ?? "");
+    const status = String(o["status"] ?? "observation");
     if (!VALID_STATUSES.has(status)) return [];
-    const confidence = Number(o["confidence"] ?? 0);
+    const rawConf = o["confidence"];
+    const confidence = rawConf === undefined || rawConf === null ? 0.6 : Number(rawConf);
     if (isNaN(confidence) || confidence < 0.5) return [];
     return [{ text, status: status as Status, confidence }];
   });
@@ -128,7 +129,7 @@ export async function runRouter(window: string): Promise<RouterOp[]> {
 
   debugLog("router", `calling provider=${primarySpec.provider} model=${primarySpec.model} prompt_len=${prompt.length}`);
 
-  const args = await (async () => {
+  let args: any = await (async () => {
     try {
       const r = await callLlmTool(prompt, RECORD_MEMORY_TOOL, primarySpec);
       debugLog("router", `primary tool call successful: ${r !== null}`);
@@ -149,6 +150,15 @@ export async function runRouter(window: string): Promise<RouterOp[]> {
       }
     }
   })();
+
+  // Tolerate models that answer with a bare object or a JSON string instead of
+  // the expected { operations: [...] } envelope (common with small Ollama models).
+  if (typeof args === "string") {
+    try { args = JSON.parse(args); } catch { args = null; }
+  }
+  if (args && !Array.isArray(args.operations) && (typeof args.text === "string" || typeof args.status === "string")) {
+    args = { operations: [args] };
+  }
 
   if (!args || !Array.isArray(args.operations)) {
     debugLog("router", "no valid operations found or tool was not called");

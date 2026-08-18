@@ -1,6 +1,8 @@
 import { qd, CODE_VECTORS, colName } from "../qdrant.js";
 import { embedOne } from "../embedder.js";
 import { cfg, getProjectId, getCurrentBranchCached } from "../config.js";
+import { getProjectDir } from "../request-context.js";
+import { isGitRepo, getCurrentBranch } from "../indexer/git.js";
 import { rerank as rerankHits } from "../reranker.js";
 import type { Schemas } from "@qdrant/js-client-rest";
 import { callLlmSimple, defaultRouterSpec } from "../llm-client.js";
@@ -20,6 +22,18 @@ export interface SearchCodeArgs {
 }
 
 type ScoredPoint = Schemas["ScoredPoint"];
+
+/** Branch da request: explícita → git real do projectDir → global (se não "default"). */
+function resolveRequestBranch(explicit?: string): string | undefined {
+  if (explicit) return explicit;
+  const dir = getProjectDir();
+  if (dir && isGitRepo(dir)) {
+    const b = getCurrentBranch(dir);
+    if (b && b !== "default") return b;
+  }
+  const cached = getCurrentBranchCached();
+  return cached && cached !== "default" ? cached : undefined;
+}
 
 export async function searchCodeTool(a: SearchCodeArgs): Promise<string> {
   let searchQuery = a.query;
@@ -47,11 +61,16 @@ export async function searchCodeTool(a: SearchCodeArgs): Promise<string> {
 
   const embedding = await embedOne(searchQuery);
 
-  const branchFilter = a.branch || getCurrentBranchCached();
+  // Branch da request, derivada do git real do diretório — o getCurrentBranchCached()
+  // global fica "default" em servidor multi-projeto e faria o filtro branches excluir
+  // tudo. Sem branch resolvida → sem filtro de branch.
+  const branchFilter = resolveRequestBranch(a.branch);
   const must: Array<{ key: string; match: { value: string } | { text: string } }> = [
     { key: "project_id", match: { value: getProjectId() } },
-    { key: "branches",   match: { value: branchFilter  } },
   ];
+  if (branchFilter) {
+    must.push({ key: "branches", match: { value: branchFilter } });
+  }
   // match: { text } without a full-text index performs exact substring matching in Qdrant
   if (a.file_path)    must.push({ key: "file_path",  match: { text:  a.file_path    } });
   if (a.chunk_type)   must.push({ key: "chunk_type", match: { value: a.chunk_type   } });

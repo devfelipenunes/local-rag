@@ -43,7 +43,8 @@
     "bench": "node dist/scripts/benchmark.js",
     "bench:fast": "node dist/scripts/benchmark.js --no-descriptions",
     "bench:rerun": "node dist/scripts/benchmark.js --skip-index",
-    "prepublish": "pnpm build"
+    "prepublish": "pnpm build",
+    "prepare": "pnpm build"
   },
   "dependencies": {
     "@fastify/static": "^9.1.3",
@@ -56,6 +57,7 @@
     "smol-toml": "^1.6.1",
     "tree-sitter-go": "^0.25.0",
     "tree-sitter-rust": "^0.24.0",
+    "tree-sitter-solidity": "^1.2.13",
     "tree-sitter-typescript": "^0.23.2",
     "web-tree-sitter": "^0.26.9",
     "zod": "^4.4.3"

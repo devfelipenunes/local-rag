@@ -1,11 +1,24 @@
 import { qd, colName, CODE_VECTORS } from "../qdrant.js";
 import { embedOne } from "../embedder.js";
 import { cfg, getProjectId, getCurrentBranchCached } from "../config.js";
+import { getProjectDir } from "../request-context.js";
+import { isGitRepo, getCurrentBranch } from "../indexer/git.js";
 import type { Schemas } from "@qdrant/js-client-rest";
 
 type ScoredPoint = Schemas["ScoredPoint"];
 
 type Leg = "lexical" | "import-graph" | "semantic";
+
+/** Branch da request: git real do projectDir → global (se não "default"). */
+function resolveRequestBranch(): string | undefined {
+  const dir = getProjectDir();
+  if (dir && isGitRepo(dir)) {
+    const b = getCurrentBranch(dir);
+    if (b && b !== "default") return b;
+  }
+  const cached = getCurrentBranchCached();
+  return cached && cached !== "default" ? cached : undefined;
+}
 
 export interface FindUsagesArgs { symbol_id: string; limit: number; }
 
@@ -24,10 +37,15 @@ export async function findUsagesTool(a: FindUsagesArgs): Promise<string> {
   const filePath  = String(p["file_path"] ?? "");
   if (!name) return `Symbol '${a.symbol_id}' has no name.`;
 
-  const projectFilter = { must: [
-    { key: "project_id", match: { value: getProjectId() } },
-    { key: "branches",   match: { value: getCurrentBranchCached() } },
-  ] };
+  // Branch da request, derivada do git real do diretório — o getCurrentBranchCached()
+  // global fica "default" em servidor multi-projeto e faria o filtro branches excluir
+  // tudo. Sem branch resolvida → sem filtro de branch.
+  const branchFilter = resolveRequestBranch();
+  const projectMust = [{ key: "project_id", match: { value: getProjectId() } }];
+  if (branchFilter) {
+    projectMust.push({ key: "branches", match: { value: branchFilter } });
+  }
+  const projectFilter = { must: projectMust };
 
   // Lexical: only search content — searching `name` field finds same-named
   // symbols in other files (definitions), not actual usages.
@@ -62,7 +80,9 @@ export async function findUsagesTool(a: FindUsagesArgs): Promise<string> {
           filter: {
             must: [
               { key: "project_id", match: { value: getProjectId() } },
-              { key: "branches",   match: { value: getCurrentBranchCached() } },
+              ...(branchFilter
+                ? [{ key: "branches", match: { value: branchFilter } }]
+                : []),
               { key: "imports",    match: { value: filePath      } },
             ],
           },

@@ -74,7 +74,7 @@ export const cfg: RuntimeConfig = {
   port:                 7531,
   projectId:            "default",
   debugLogPath:         process.env["MEMORY_DEBUG_LOG"] ?? "",
-  generateDescriptions: true,
+  generateDescriptions: false,
   projectDir:           "",
   includePaths:         [],
   dashboard:            true,

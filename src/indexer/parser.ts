@@ -37,6 +37,7 @@ const EXT_MAP: Record<string, ExtEntry> = {
   // New tree-sitter languages
   ".rs":   { kind: "treesitter", wasmKey: "rust",       defKey: "rust" },
   ".go":   { kind: "treesitter", wasmKey: "go",         defKey: "go"  },
+  ".sol":  { kind: "treesitter", wasmKey: "solidity",   defKey: "solidity" },
   // Data formats
   ".yaml": { kind: "data", parser: "yaml" },
   ".yml":  { kind: "data", parser: "yaml" },
@@ -283,10 +284,39 @@ const GO_DEF: LanguageDef = {
   importNode: "import_declaration",
 };
 
+const SOLIDITY_DEF: LanguageDef = {
+  language: "solidity",
+  extractNodes: new Set([
+    "contract_declaration", "interface_declaration", "library_declaration",
+    "function_definition", "modifier_definition", "error_declaration",
+    "event_definition", "struct_declaration", "enum_declaration",
+    "state_variable_declaration",
+  ]),
+  chunkTypeMap: {
+    contract_declaration:       "class",
+    interface_declaration:      "interface",
+    library_declaration:        "library",
+    function_definition:        "function",
+    modifier_definition:        "modifier",
+    error_declaration:          "error",
+    event_definition:           "event",
+    struct_declaration:         "struct",
+    enum_declaration:           "enum",
+    state_variable_declaration: "variable",
+  },
+  containerNodes: new Set([
+    "contract_declaration", "interface_declaration", "library_declaration",
+  ]),
+  extractName: extractNameField,
+  docStyle: "slashslash",
+  importNode: "import_directive",
+};
+
 const LANG_DEFS: Record<string, LanguageDef> = {
   typescript: TS_DEF,
   rust:       RUST_DEF,
   go:         GO_DEF,
+  solidity:   SOLIDITY_DEF,
 };
 
 // ── parser cache ──────────────────────────────────────────────────────────────
@@ -413,6 +443,15 @@ function extractImportSource(node: SyntaxNode, language: string): string {
           const raw = grandchild.text;
           return raw.slice(1, raw.length - 1);
         }
+      }
+    }
+  } else if (language === "solidity") {
+    // import_directive: import "path" or import {...} from "path"
+    // (o nó do caminho em tree-sitter-solidity é `string`, não `string_literal`)
+    for (const child of node.children) {
+      if (child.type === "string") {
+        const raw = child.text;
+        return raw.slice(1, raw.length - 1);
       }
     }
   }

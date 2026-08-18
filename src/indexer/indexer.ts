@@ -20,6 +20,8 @@ const DESC_CONCURRENCY = 5;
 const IGNORE_DIRS = new Set([
   "node_modules", ".git", "dist", "build", ".next", "coverage",
   "vendor", "charts", "testdata",
+  // Foundry build artifacts — hundreds of MB of JSON, zero semantic value.
+  "lib", "broadcast", "cache",
 ]);
 
 /**
