@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { readFileSync, existsSync } from "node:fs";
 import type { StoreMemoryParams } from "./types.js";
@@ -72,7 +72,7 @@ export async function storeMemory(params: StoreMemoryParams): Promise<string> {
     return `already exists: ${existing[0]!.id}`;
   }
 
-  const memId = crypto.randomUUID();
+  const memId = randomUUID();
   const now = nowIso();
   const tagList = tags
     ? tags

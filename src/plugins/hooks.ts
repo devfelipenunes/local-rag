@@ -10,6 +10,7 @@
  */
 
 import { FastifyInstance } from "fastify";
+import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { basename } from "node:path";
 import { resolveWorktreeMainRoot } from "../indexer/git.js";
@@ -56,7 +57,7 @@ async function persistHookCall(
   projectId: string,
   extraPayload: Record<string, unknown> = {},
 ): Promise<void> {
-  const id         = crypto.randomUUID();
+  const id         = randomUUID();
   const now        = nowIso();
   const expiresAt  = new Date(Date.now() + HOOK_CALL_TTL_DAYS * 86_400_000).toISOString();
 

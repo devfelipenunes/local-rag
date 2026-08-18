@@ -331,7 +331,7 @@ async function _callOllamaWithTools(
 
   const resp1 = await _fetchWithLogging(`${baseUrl}/api/chat`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages: msgs1, tools: toolDefs, stream: false }),
+    body: JSON.stringify({ model, messages: msgs1, tools: toolDefs, stream: false, think: false }),
     signal: AbortSignal.timeout(timeout),
   }, model);
   await _throwIfNotOk(resp1, "Ollama tools", model);
@@ -351,7 +351,7 @@ async function _callOllamaWithTools(
   const msgs2 = [...msgs1, { role: "assistant", content: msg1.content, tool_calls: msg1.tool_calls }, { role: "tool", content: toolResult }];
   const resp2 = await _fetchWithLogging(`${baseUrl}/api/chat`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages: msgs2, stream: false }),
+    body: JSON.stringify({ model, messages: msgs2, stream: false, think: false }),
     signal: AbortSignal.timeout(timeout),
   }, model);
   await _throwIfNotOk(resp2, "Ollama tool result", model);
@@ -552,7 +552,7 @@ async function _callOllamaTool(prompt: string, tool: ToolDef, model: string, bas
   const msgs = [{ role: "user", content: prompt }];
   const resp = await _fetchWithLogging(`${baseUrl}/api/chat`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages: msgs, tools: toolDefs, stream: false }),
+    body: JSON.stringify({ model, messages: msgs, tools: toolDefs, stream: false, think: false }),
     signal: AbortSignal.timeout(timeout),
   }, model);
   await _throwIfNotOk(resp, "Ollama tool structured", model);

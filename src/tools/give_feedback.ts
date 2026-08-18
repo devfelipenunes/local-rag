@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { qd, colName }              from "../qdrant.js";
 import { embedOne }                  from "../embedder.js";
 import { getProjectId }              from "../request-context.js";
@@ -16,7 +17,7 @@ export async function giveFeedbackTool(a: GiveFeedbackArgs): Promise<string> {
   // Resolve session_id: args first, then SessionStore fallback, then "unknown"
   const sessionId = a.session_id || getSession(projectId) || "unknown";
 
-  const id        = crypto.randomUUID();
+  const id        = randomUUID();
   const now       = nowIso();
   const embedding = await embedOne(a.content);
 
