@@ -6,22 +6,36 @@ import { embedBatch, embedOne, generateDescription } from "../embedder.js";
 import { parseFile, EXTENSIONS } from "./parser.js";
 import { ImportResolver } from "./resolver.js";
 import { GitignoreFilter } from "./gitignore.js";
-import {
-  setDeps,
-  clearDeps,
-  invalidateProjectOverview,
-} from "../storage.js";
+import { setDeps, clearDeps, invalidateProjectOverview } from "../storage.js";
 import type { CodeChunk } from "../types.js";
 import { qd, CODE_VECTORS, colName } from "../qdrant.js";
 import { type FileManifest, listWorktreePaths } from "./git.js";
 
-const BATCH_SIZE  = 32;
+const BATCH_SIZE = 32;
 const DESC_CONCURRENCY = 5;
 const IGNORE_DIRS = new Set([
-  "node_modules", ".git", "dist", "build", ".next", "coverage",
-  "vendor", "charts", "testdata",
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  ".next",
+  "coverage",
+  "vendor",
+  "charts",
+  "testdata",
   // Foundry build artifacts — hundreds of MB of JSON, zero semantic value.
-  "lib", "broadcast", "cache",
+  "lib",
+  "broadcast",
+  "cache",
+  // Python/Rust dependency & build trees: site-packages is 100k+ junk files
+  // (scipy test data, LICENSE copies, top_level.txt) that pollute the index
+  // and stall the CPU. `venv`/`target` have no leading dot, so the dot rule
+  // in collectFiles does NOT skip them — they must be listed explicitly.
+  "venv",
+  ".venv",
+  "__pycache__",
+  "site-packages",
+  "target",
 ]);
 
 /**
@@ -30,7 +44,11 @@ const IGNORE_DIRS = new Set([
  * surface as plain `TypeError` / `Error` here; the indexer should ride those
  * out rather than failing the file.
  */
-async function _retryTransient<T>(fn: () => Promise<T>, label: string, attempts = 3): Promise<T> {
+async function _retryTransient<T>(
+  fn: () => Promise<T>,
+  label: string,
+  attempts = 3,
+): Promise<T> {
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -62,8 +80,8 @@ export class CodeIndexer {
   public readonly projectId: string;
   public readonly projectRoot: string;
   public readonly includePaths: string[];
-  private resolver: ImportResolver    | null = null;
-  private ignFilter: GitignoreFilter  | null = null;
+  private resolver: ImportResolver | null = null;
+  private ignFilter: GitignoreFilter | null = null;
   private _indexInFlight = new Map<string, Promise<[number, number]>>();
   private _branch = "default";
   private readonly collection = colName("code_chunks");
@@ -85,60 +103,115 @@ export class CodeIndexer {
     if (opts.branch) this._branch = opts.branch;
   }
 
-  get branch(): string { return this._branch; }
-  set branch(v: string) { this._branch = v; }
+  get branch(): string {
+    return this._branch;
+  }
+  set branch(v: string) {
+    this._branch = v;
+  }
 
   async ensureCollection(): Promise<void> {
     const { collections } = await qd.getCollections();
     const existing = collections.find((c) => c.name === this.collection);
 
     if (existing) {
-      const info    = await qd.getCollection(this.collection);
-      const vectors = info.config?.params?.vectors as Record<string, unknown> | undefined;
-      const hasNamedVectors = vectors !== undefined && CODE_VECTORS.code in vectors;
+      const info = await qd.getCollection(this.collection);
+      const vectors = info.config?.params?.vectors as
+        Record<string, unknown> | undefined;
+      const hasNamedVectors =
+        vectors !== undefined && CODE_VECTORS.code in vectors;
       if (hasNamedVectors) {
         // Idempotent: ensure all indexes exist (mirrors ensureCodeChunks in qdrant.ts).
         for (const f of ["imports", "branches"]) {
-          await qd.createPayloadIndex(this.collection, { field_name: f, field_schema: "keyword", wait: true })
+          await qd
+            .createPayloadIndex(this.collection, {
+              field_name: f,
+              field_schema: "keyword",
+              wait: true,
+            })
             .catch(() => undefined);
         }
         // Migrate name index from word → prefix tokenizer so name_pattern substring search works.
-        await qd.deletePayloadIndex(this.collection, "name").catch(() => undefined);
-        await qd.createPayloadIndex(this.collection, {
-          field_name: "name", field_schema: { type: "text", tokenizer: "prefix", min_token_len: 2, lowercase: true }, wait: true,
-        }).catch(() => undefined);
-        await qd.createPayloadIndex(this.collection, {
-          field_name: "content", field_schema: { type: "text", tokenizer: "word", min_token_len: 2, lowercase: true }, wait: true,
-        }).catch(() => undefined);
+        await qd
+          .deletePayloadIndex(this.collection, "name")
+          .catch(() => undefined);
+        await qd
+          .createPayloadIndex(this.collection, {
+            field_name: "name",
+            field_schema: {
+              type: "text",
+              tokenizer: "prefix",
+              min_token_len: 2,
+              lowercase: true,
+            },
+            wait: true,
+          })
+          .catch(() => undefined);
+        await qd
+          .createPayloadIndex(this.collection, {
+            field_name: "content",
+            field_schema: {
+              type: "text",
+              tokenizer: "word",
+              min_token_len: 2,
+              lowercase: true,
+            },
+            wait: true,
+          })
+          .catch(() => undefined);
         return;
       }
 
       process.stderr.write(
-        `[indexer] Migrating ${this.collection} to named vectors (existing index will be cleared)\n`
+        `[indexer] Migrating ${this.collection} to named vectors (existing index will be cleared)\n`,
       );
       await qd.deleteCollection(this.collection);
     }
 
     await qd.createCollection(this.collection, {
       vectors: {
-        [CODE_VECTORS.code]:        { size: cfg.embedDim, distance: "Cosine" },
+        [CODE_VECTORS.code]: { size: cfg.embedDim, distance: "Cosine" },
         [CODE_VECTORS.description]: { size: cfg.embedDim, distance: "Cosine" },
       },
     });
-    for (const field of ["file_path", "chunk_type", "language", "project_id", "parent_id", "imports"]) {
+    for (const field of [
+      "file_path",
+      "chunk_type",
+      "language",
+      "project_id",
+      "parent_id",
+      "imports",
+    ]) {
       await qd.createPayloadIndex(this.collection, {
-        field_name:   field,
+        field_name: field,
         field_schema: "keyword",
-        wait:         true,
+        wait: true,
       });
     }
     for (const [field, schema] of [
-      ["name",    { type: "text", tokenizer: "prefix", min_token_len: 2, lowercase: true }],
-      ["content", { type: "text", tokenizer: "word",   min_token_len: 2, lowercase: true }],
+      [
+        "name",
+        {
+          type: "text",
+          tokenizer: "prefix",
+          min_token_len: 2,
+          lowercase: true,
+        },
+      ],
+      [
+        "content",
+        { type: "text", tokenizer: "word", min_token_len: 2, lowercase: true },
+      ],
     ] as const) {
-      await qd.createPayloadIndex(this.collection, { field_name: field, field_schema: schema, wait: true });
+      await qd.createPayloadIndex(this.collection, {
+        field_name: field,
+        field_schema: schema,
+        wait: true,
+      });
     }
-    process.stderr.write(`[indexer] Created collection '${this.collection}' (named vectors)\n`);
+    process.stderr.write(
+      `[indexer] Created collection '${this.collection}' (named vectors)\n`,
+    );
   }
 
   /** Reload the cached list of git-worktree root paths from disk. */
@@ -146,14 +219,19 @@ export class CodeIndexer {
     if (!this.projectRoot) {
       this.worktreePaths = [];
     } else {
-      this.worktreePaths = listWorktreePaths(this.projectRoot).map((p) => resolve(p));
+      this.worktreePaths = listWorktreePaths(this.projectRoot).map((p) =>
+        resolve(p),
+      );
     }
     this.worktreePathsLoadedAt = Date.now();
   }
 
   /** Worktree paths, refreshed at most once per WORKTREE_CACHE_MS. */
   private getWorktreePaths(): string[] {
-    if (Date.now() - this.worktreePathsLoadedAt > CodeIndexer.WORKTREE_CACHE_MS) {
+    if (
+      Date.now() - this.worktreePathsLoadedAt >
+      CodeIndexer.WORKTREE_CACHE_MS
+    ) {
       this.refreshWorktreePaths();
     }
     return this.worktreePaths;
@@ -165,16 +243,24 @@ export class CodeIndexer {
    */
   shouldSkip(absPath: string): boolean {
     const parts = absPath.split("/");
-    const name  = basename(absPath);
-    const ext   = extname(absPath);
+    const name = basename(absPath);
+    const ext = extname(absPath);
     if (name.startsWith(".")) return true;
     if (!EXTENSIONS.has(ext)) return true;
+
+    // Protobuf/gRPC generated code — machine output with zero semantic value
+    // for RAG. penumbra's view.pb.go alone produced 1,688 chunks of
+    // boilerplate. Matches *.pb.go / *._pb.ts / *.pb.rs / *.pb.js and the
+    // *_grpc.pb.go variants (all end in .pb.go, so one pattern covers them).
+    if (/\.pb\.(go|rs|ts|tsx|js|jsx)$/.test(name)) return true;
 
     // Safety check for file size (only if file exists)
     if (ext === ".json" && existsSync(absPath)) {
       try {
         if (statSync(absPath).size > 100_000) return true;
-      } catch { /* ignore stat errors */ }
+      } catch {
+        /* ignore stat errors */
+      }
     }
 
     for (const part of parts) {
@@ -189,7 +275,7 @@ export class CodeIndexer {
 
     if (this.includePaths.length > 0) {
       const base = resolve(this.projectRoot || ".");
-      const included = this.includePaths.some(p => {
+      const included = this.includePaths.some((p) => {
         const abs = resolve(base, p);
         return absPath.startsWith(abs + "/") || absPath === abs;
       });
@@ -206,7 +292,7 @@ export class CodeIndexer {
     const absRoot = resolve(root);
     // Build a fresh filter so rules discovered during recursion accumulate.
     const filter = new GitignoreFilter();
-    this.ignFilter = filter;          // expose for shouldSkip / watcher
+    this.ignFilter = filter; // expose for shouldSkip / watcher
     this.refreshWorktreePaths();
 
     const results: string[] = [];
@@ -220,7 +306,9 @@ export class CodeIndexer {
         let st: ReturnType<typeof statSync>;
         try {
           st = statSync(abs);
-        } catch { continue; }
+        } catch {
+          continue;
+        }
 
         if (st.isDirectory()) {
           // Hard-coded skips (fastest check first).
@@ -255,7 +343,7 @@ export class CodeIndexer {
     await qd.delete(this.collection, {
       filter: {
         must: [
-          { key: "file_path",  match: { value: relPath       } },
+          { key: "file_path", match: { value: relPath } },
           { key: "project_id", match: { value: this.projectId } },
         ],
       },
@@ -269,22 +357,29 @@ export class CodeIndexer {
   async untagFile(relPath: string, branch: string): Promise<void> {
     let offset: string | number | undefined;
     while (true) {
-      const result = await qd.scroll(this.collection, {
-        filter: {
-          must: [
-            { key: "file_path",  match: { value: relPath       } },
-            { key: "project_id", match: { value: this.projectId } },
-            { key: "branches",   match: { value: branch        } },
-          ],
-        },
-        limit:        500,
-        with_payload: ["branches"],
-        with_vector:  false,
-        ...(offset !== undefined && { offset }),
-      }).catch((): { points: []; next_page_offset: undefined } => ({ points: [], next_page_offset: undefined }));
+      const result = await qd
+        .scroll(this.collection, {
+          filter: {
+            must: [
+              { key: "file_path", match: { value: relPath } },
+              { key: "project_id", match: { value: this.projectId } },
+              { key: "branches", match: { value: branch } },
+            ],
+          },
+          limit: 500,
+          with_payload: ["branches"],
+          with_vector: false,
+          ...(offset !== undefined && { offset }),
+        })
+        .catch((): { points: []; next_page_offset: undefined } => ({
+          points: [],
+          next_page_offset: undefined,
+        }));
 
       for (const p of result.points) {
-        const old = ((p.payload ?? {}) as Record<string, unknown>)["branches"] as string[] | undefined ?? [];
+        const old =
+          (((p.payload ?? {}) as Record<string, unknown>)["branches"] as
+            string[] | undefined) ?? [];
         const updated = old.filter((b) => b !== branch);
         // Always update payload — never hard-delete during indexing.
         // Chunks with branches:[] are orphaned and will be cleaned up by gc().
@@ -295,7 +390,8 @@ export class CodeIndexer {
         } as never);
       }
 
-      const next = (result as { next_page_offset?: string | number | null }).next_page_offset;
+      const next = (result as { next_page_offset?: string | number | null })
+        .next_page_offset;
       if (!next) break;
       offset = next;
     }
@@ -305,31 +401,40 @@ export class CodeIndexer {
    * Incremental file indexing: reuses existing chunks when file_hash matches.
    * Returns [chunks_processed, elapsed_ms].
    */
-  async indexFileIncremental(absPath: string, root: string, branch?: string): Promise<[number, number]> {
+  async indexFileIncremental(
+    absPath: string,
+    root: string,
+    branch?: string,
+  ): Promise<[number, number]> {
     const t0 = Date.now();
     const br = branch ?? this._branch;
     const pathBase = this.projectRoot ? resolve(this.projectRoot) : root;
-    const relPath  = relative(pathBase, absPath).replace(/\\/g, "/");
-    const source   = readFileSync(absPath, "utf8");
-    const newHash  = hashSource(source);
+    const relPath = relative(pathBase, absPath).replace(/\\/g, "/");
+    const source = readFileSync(absPath, "utf8");
+    const newHash = hashSource(source);
 
     // Check if chunks with the same file_hash already exist (from any branch)
-    const existing = await qd.scroll(this.collection, {
-      filter: {
-        must: [
-          { key: "file_path",  match: { value: relPath       } },
-          { key: "file_hash",  match: { value: newHash        } },
-          { key: "project_id", match: { value: this.projectId } },
-        ],
-      },
-      limit:        1,
-      with_payload: ["branches"],
-      with_vector:  false,
-    }).catch((): { points: [] } => ({ points: [] }));
+    const existing = await qd
+      .scroll(this.collection, {
+        filter: {
+          must: [
+            { key: "file_path", match: { value: relPath } },
+            { key: "file_hash", match: { value: newHash } },
+            { key: "project_id", match: { value: this.projectId } },
+          ],
+        },
+        limit: 1,
+        with_payload: ["branches"],
+        with_vector: false,
+      })
+      .catch((): { points: [] } => ({ points: [] }));
 
     if (existing.points.length > 0) {
       // Chunks exist with this content — check if branch is already tagged
-      const branches = ((existing.points[0]!.payload ?? {}) as Record<string, unknown>)["branches"] as string[] | undefined ?? [];
+      const branches =
+        (((existing.points[0]!.payload ?? {}) as Record<string, unknown>)[
+          "branches"
+        ] as string[] | undefined) ?? [];
       if (branches.includes(br)) {
         return [0, Date.now() - t0]; // Already tagged for this branch
       }
@@ -351,25 +456,36 @@ export class CodeIndexer {
   }
 
   /** Add a branch tag to all chunks of file_path + file_hash. */
-  private async _addBranchTag(relPath: string, fileHash: string, branch: string): Promise<void> {
+  private async _addBranchTag(
+    relPath: string,
+    fileHash: string,
+    branch: string,
+  ): Promise<void> {
     let offset: string | number | undefined;
     while (true) {
-      const result = await qd.scroll(this.collection, {
-        filter: {
-          must: [
-            { key: "file_path",  match: { value: relPath       } },
-            { key: "file_hash",  match: { value: fileHash       } },
-            { key: "project_id", match: { value: this.projectId } },
-          ],
-        },
-        limit:        500,
-        with_payload: ["branches"],
-        with_vector:  false,
-        ...(offset !== undefined && { offset }),
-      }).catch((): { points: []; next_page_offset: undefined } => ({ points: [], next_page_offset: undefined }));
+      const result = await qd
+        .scroll(this.collection, {
+          filter: {
+            must: [
+              { key: "file_path", match: { value: relPath } },
+              { key: "file_hash", match: { value: fileHash } },
+              { key: "project_id", match: { value: this.projectId } },
+            ],
+          },
+          limit: 500,
+          with_payload: ["branches"],
+          with_vector: false,
+          ...(offset !== undefined && { offset }),
+        })
+        .catch((): { points: []; next_page_offset: undefined } => ({
+          points: [],
+          next_page_offset: undefined,
+        }));
 
       for (const p of result.points) {
-        const old = ((p.payload ?? {}) as Record<string, unknown>)["branches"] as string[] | undefined ?? [];
+        const old =
+          (((p.payload ?? {}) as Record<string, unknown>)["branches"] as
+            string[] | undefined) ?? [];
         if (!old.includes(branch)) {
           await qd.setPayload(this.collection, {
             payload: { branches: [...old, branch] },
@@ -379,7 +495,8 @@ export class CodeIndexer {
         }
       }
 
-      const next = (result as { next_page_offset?: string | number | null }).next_page_offset;
+      const next = (result as { next_page_offset?: string | number | null })
+        .next_page_offset;
       if (!next) break;
       offset = next;
     }
@@ -390,7 +507,11 @@ export class CodeIndexer {
    * If chunks with the same hash already exist they are tagged for the new branch (no re-embed).
    * Only files whose content is not yet in Qdrant are indexed from scratch.
    */
-  async switchBranch(root: string, oldBranch: string, newBranch: string): Promise<void> {
+  async switchBranch(
+    root: string,
+    oldBranch: string,
+    newBranch: string,
+  ): Promise<void> {
     const t0 = Date.now();
     const pathBase = this.projectRoot ? resolve(this.projectRoot) : root;
     this._branch = newBranch;
@@ -405,13 +526,17 @@ export class CodeIndexer {
     );
 
     for (const absPath of files) {
-      await this.indexFileIncremental(absPath, root, newBranch).catch((err: unknown) => {
-        process.stderr.write(`[indexer] ${absPath}: ${String(err)}\n`);
-      });
+      await this.indexFileIncremental(absPath, root, newBranch).catch(
+        (err: unknown) => {
+          process.stderr.write(`[indexer] ${absPath}: ${String(err)}\n`);
+        },
+      );
     }
 
     await invalidateProjectOverview(this.projectId).catch(() => undefined);
-    process.stderr.write(`[indexer] Branch switch complete in ${Date.now() - t0}ms\n`);
+    process.stderr.write(
+      `[indexer] Branch switch complete in ${Date.now() - t0}ms\n`,
+    );
   }
 
   /** Build a manifest from files currently on disk. */
@@ -424,7 +549,9 @@ export class CodeIndexer {
       try {
         const source = readFileSync(absPath, "utf8");
         manifest[relPath] = hashSource(source);
-      } catch { /* skip unreadable files */ }
+      } catch {
+        /* skip unreadable files */
+      }
     }
     return manifest;
   }
@@ -433,13 +560,13 @@ export class CodeIndexer {
     const result = await qd.scroll(this.collection, {
       filter: {
         must: [
-          { key: "file_path",  match: { value: relPath       } },
+          { key: "file_path", match: { value: relPath } },
           { key: "project_id", match: { value: this.projectId } },
         ],
       },
-      limit:        1,
+      limit: 1,
       with_payload: ["file_hash"],
-      with_vector:  false,
+      with_vector: false,
     });
     const point = result.points[0];
     if (!point) return null;
@@ -451,47 +578,61 @@ export class CodeIndexer {
    * Scroll Qdrant for chunks in this project missing a `description` payload field.
    * Uses the `is_empty` filter so we only walk the rows that actually need work.
    */
-  private async _scrollMissingDescriptions(limit: number): Promise<Array<{
-    id:        string;
-    content:   string;
-    name:      string;
-    chunkType: string;
-    language:  string;
-    filePath:  string;
-    isChild:   boolean;
-  }>> {
-    const toUpdate: Array<{
-      id:        string;
-      content:   string;
-      name:      string;
+  private async _scrollMissingDescriptions(limit: number): Promise<
+    Array<{
+      id: string;
+      content: string;
+      name: string;
       chunkType: string;
-      language:  string;
-      filePath:  string;
-      isChild:   boolean;
+      language: string;
+      filePath: string;
+      isChild: boolean;
+    }>
+  > {
+    const toUpdate: Array<{
+      id: string;
+      content: string;
+      name: string;
+      chunkType: string;
+      language: string;
+      filePath: string;
+      isChild: boolean;
     }> = [];
 
-    const result = await qd.scroll(this.collection, {
-      filter: {
-        must: [
-          { key: "project_id", match: { value: this.projectId } },
-          { is_empty: { key: "description" } },
+    const result = await qd
+      .scroll(this.collection, {
+        filter: {
+          must: [
+            { key: "project_id", match: { value: this.projectId } },
+            { is_empty: { key: "description" } },
+          ],
+        },
+        limit,
+        with_payload: [
+          "content",
+          "name",
+          "chunk_type",
+          "language",
+          "parent_id",
+          "file_path",
         ],
-      },
-      limit,
-      with_payload: ["content", "name", "chunk_type", "language", "parent_id", "file_path"],
-      with_vector:  false,
-    } as never).catch((): { points: []; next_page_offset: undefined } => ({ points: [], next_page_offset: undefined }));
+        with_vector: false,
+      } as never)
+      .catch((): { points: []; next_page_offset: undefined } => ({
+        points: [],
+        next_page_offset: undefined,
+      }));
 
     for (const p of result.points) {
       const pl = (p.payload ?? {}) as Record<string, unknown>;
       toUpdate.push({
-        id:        String(p.id),
-        content:   String(pl["content"]    ?? ""),
-        name:      String(pl["name"]       ?? ""),
+        id: String(p.id),
+        content: String(pl["content"] ?? ""),
+        name: String(pl["name"] ?? ""),
         chunkType: String(pl["chunk_type"] ?? ""),
-        language:  String(pl["language"]   ?? ""),
-        filePath:  String(pl["file_path"]  ?? ""),
-        isChild:   typeof pl["parent_id"]  === "string",
+        language: String(pl["language"] ?? ""),
+        filePath: String(pl["file_path"] ?? ""),
+        isChild: typeof pl["parent_id"] === "string",
       });
     }
     return toUpdate;
@@ -502,22 +643,29 @@ export class CodeIndexer {
    * the resulting payload + description vector back. Returns counters so the
    * drainer can adapt its sleep interval on widespread failure.
    */
-  private async _writeDescriptionsBatch(toUpdate: Array<{
-    id: string; content: string; name: string; chunkType: string;
-    language: string; filePath: string; isChild: boolean;
-  }>): Promise<{ written: number; failed: number }> {
+  private async _writeDescriptionsBatch(
+    toUpdate: Array<{
+      id: string;
+      content: string;
+      name: string;
+      chunkType: string;
+      language: string;
+      filePath: string;
+      isChild: boolean;
+    }>,
+  ): Promise<{ written: number; failed: number }> {
     if (toUpdate.length === 0) return { written: 0, failed: 0 };
 
     const fakeChunks: CodeChunk[] = toUpdate.map((t) => ({
-      content:   t.content,
-      name:      t.name,
+      content: t.content,
+      name: t.name,
       chunkType: t.chunkType,
-      language:  t.language,
-      filePath:  t.filePath,
+      language: t.language,
+      filePath: t.filePath,
       signature: "",
       startLine: 0,
-      endLine:   0,
-      jsdoc:     "",
+      endLine: 0,
+      jsdoc: "",
     }));
 
     const descriptions = await this.batchGenerateDescriptions(fakeChunks);
@@ -533,7 +681,9 @@ export class CodeIndexer {
     }
     const descVecs: (number[] | null)[] = new Array(toUpdate.length).fill(null);
     if (toEmbed.length > 0) {
-      const vecs = await embedBatch(toEmbed.map((e) => e.text)).catch(() => null);
+      const vecs = await embedBatch(toEmbed.map((e) => e.text)).catch(
+        () => null,
+      );
       if (vecs) {
         for (let j = 0; j < toEmbed.length; j++) {
           descVecs[toEmbed[j]!.idx] = vecs[j] ?? null;
@@ -545,24 +695,32 @@ export class CodeIndexer {
     for (let i = 0; i < toUpdate.length; i++) {
       const { id, isChild } = toUpdate[i]!;
       const desc = descriptions[i];
-      const vec  = descVecs[i];
+      const vec = descVecs[i];
       if (!desc) continue;
 
-      await qd.setPayload(this.collection, {
-        payload: { description: desc },
-        points:  [id],
-        wait:    true,
-      } as never).catch((err: unknown) => {
-        process.stderr.write(`[drainer] setPayload failed for ${id}: ${String(err)}\n`);
-      });
+      await qd
+        .setPayload(this.collection, {
+          payload: { description: desc },
+          points: [id],
+          wait: true,
+        } as never)
+        .catch((err: unknown) => {
+          process.stderr.write(
+            `[drainer] setPayload failed for ${id}: ${String(err)}\n`,
+          );
+        });
 
       if (!isChild && vec) {
-        await qd.updateVectors(this.collection, {
-          points: [{ id, vector: { [CODE_VECTORS.description]: vec } }],
-          wait:   true,
-        } as never).catch((err: unknown) => {
-          process.stderr.write(`[drainer] updateVectors failed for ${id}: ${String(err)}\n`);
-        });
+        await qd
+          .updateVectors(this.collection, {
+            points: [{ id, vector: { [CODE_VECTORS.description]: vec } }],
+            wait: true,
+          } as never)
+          .catch((err: unknown) => {
+            process.stderr.write(
+              `[drainer] updateVectors failed for ${id}: ${String(err)}\n`,
+            );
+          });
       }
       written++;
     }
@@ -570,7 +728,7 @@ export class CodeIndexer {
   }
 
   private _drainerRunning = false;
-  private _drainerStop    = false;
+  private _drainerStop = false;
 
   /**
    * Background loop: scroll Qdrant for chunks lacking a description, generate
@@ -578,16 +736,20 @@ export class CodeIndexer {
    * until stopDrainer() is called or the worker terminates. Idle-sleeps when
    * the backlog is empty; backs off when the LLM is unavailable.
    */
-  async runDescriptionDrainer(opts?: { batchSize?: number; idleMs?: number; outageMs?: number }): Promise<void> {
-    if (!this.genDescs)        return;
-    if (this._drainerRunning)  return;
+  async runDescriptionDrainer(opts?: {
+    batchSize?: number;
+    idleMs?: number;
+    outageMs?: number;
+  }): Promise<void> {
+    if (!this.genDescs) return;
+    if (this._drainerRunning) return;
     this._drainerRunning = true;
-    this._drainerStop    = false;
+    this._drainerStop = false;
 
     const batchSize = opts?.batchSize ?? 50;
-    const idleMs    = opts?.idleMs    ?? 10_000;
-    const outageMs  = opts?.outageMs  ?? 60_000;
-    const sleep     = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    const idleMs = opts?.idleMs ?? 10_000;
+    const outageMs = opts?.outageMs ?? 60_000;
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
     process.stderr.write(`[drainer] starting for project=${this.projectId}\n`);
     try {
@@ -597,8 +759,11 @@ export class CodeIndexer {
           await sleep(idleMs);
           continue;
         }
-        const { written, failed } = await this._writeDescriptionsBatch(toUpdate);
-        process.stderr.write(`[drainer] batch ${written} written, ${failed} pending (size=${toUpdate.length})\n`);
+        const { written, failed } =
+          await this._writeDescriptionsBatch(toUpdate);
+        process.stderr.write(
+          `[drainer] batch ${written} written, ${failed} pending (size=${toUpdate.length})\n`,
+        );
         if (written === 0 && failed > 0) {
           await sleep(outageMs);
         } else {
@@ -617,7 +782,9 @@ export class CodeIndexer {
   }
 
   /** Generate descriptions for a batch of chunks (bounded concurrency). */
-  private async batchGenerateDescriptions(chunks: CodeChunk[]): Promise<(string | null)[]> {
+  private async batchGenerateDescriptions(
+    chunks: CodeChunk[],
+  ): Promise<(string | null)[]> {
     const results: (string | null)[] = new Array(chunks.length).fill(null);
     let failures = 0;
     let lastError = "";
@@ -625,13 +792,17 @@ export class CodeIndexer {
       const slice = chunks.slice(i, i + DESC_CONCURRENCY);
       const descs = await Promise.all(
         slice.map((c) =>
-          generateDescription({ content: c.content, name: c.name, chunkType: c.chunkType, language: c.language })
-            .catch((err: unknown) => {
-              failures++;
-              lastError = err instanceof Error ? err.message : String(err);
-              return null;
-            })
-        )
+          generateDescription({
+            content: c.content,
+            name: c.name,
+            chunkType: c.chunkType,
+            language: c.language,
+          }).catch((err: unknown) => {
+            failures++;
+            lastError = err instanceof Error ? err.message : String(err);
+            return null;
+          }),
+        ),
       );
       for (let j = 0; j < descs.length; j++) {
         results[i + j] = descs[j] ?? null;
@@ -646,8 +817,12 @@ export class CodeIndexer {
   }
 
   async indexFile(absPath: string, root: string): Promise<[number, number]> {
-    const prev = this._indexInFlight.get(absPath) ?? Promise.resolve([0, 0] as [number, number]);
-    const next = prev.catch((): [number, number] => [0, 0]).then(() => this._indexFileImpl(absPath, root));
+    const prev =
+      this._indexInFlight.get(absPath) ??
+      Promise.resolve([0, 0] as [number, number]);
+    const next = prev
+      .catch((): [number, number] => [0, 0])
+      .then(() => this._indexFileImpl(absPath, root));
     this._indexInFlight.set(absPath, next);
     // The derived `.finally` promise inherits any rejection from `next`; swallow it
     // here so an `_indexFileImpl` throw is observed only via the returned `next`.
@@ -660,14 +835,17 @@ export class CodeIndexer {
     return next;
   }
 
-  private async _indexFileImpl(absPath: string, root: string): Promise<[number, number]> {
+  private async _indexFileImpl(
+    absPath: string,
+    root: string,
+  ): Promise<[number, number]> {
     const t0 = Date.now();
     const pathBase = this.projectRoot ? resolve(this.projectRoot) : root;
-    const relPath  = relative(pathBase, absPath).replace(/\\/g, "/");
+    const relPath = relative(pathBase, absPath).replace(/\\/g, "/");
     if (!this.resolver) {
       this.resolver = new ImportResolver({ root: pathBase });
     }
-    const source  = readFileSync(absPath, "utf8");
+    const source = readFileSync(absPath, "utf8");
     const newHash = hashSource(source);
 
     const storedHash = await this.getFileHash(relPath);
@@ -685,15 +863,21 @@ export class CodeIndexer {
       return [0, 0];
     }
 
-    await _retryTransient(() => this.untagFile(relPath, this._branch), `untagFile ${relPath}`);
+    await _retryTransient(
+      () => this.untagFile(relPath, this._branch),
+      `untagFile ${relPath}`,
+    );
 
     // ── Dep graph ────────────────────────────────────────────────────────────
-    const rawImports      = chunks[0]?.imports ?? [];
-    const resolvedImports = rawImports.length > 0
-      ? this.resolver.resolveAll(rawImports, relPath)
-      : [];
+    const rawImports = chunks[0]?.imports ?? [];
+    const resolvedImports =
+      rawImports.length > 0
+        ? this.resolver.resolveAll(rawImports, relPath)
+        : [];
     if (resolvedImports.length > 0) {
-      await setDeps(this.projectId, relPath, resolvedImports).catch(() => undefined);
+      await setDeps(this.projectId, relPath, resolvedImports).catch(
+        () => undefined,
+      );
     }
 
     // ── Parent/child UUID assignment ─────────────────────────────────────────
@@ -732,7 +916,7 @@ export class CodeIndexer {
         codeEmbeds.push(...batch);
       } else {
         const individual = await Promise.all(
-          slice.map((t) => embedOne(t).catch((): number[] | null => null))
+          slice.map((t) => embedOne(t).catch((): number[] | null => null)),
         );
         codeEmbeds.push(...individual);
       }
@@ -744,15 +928,15 @@ export class CodeIndexer {
 
     // ── Build Qdrant points ───────────────────────────────────────────────────
     const points: Array<{
-      id:      string;
-      vector:  Record<string, number[]>;
+      id: string;
+      vector: Record<string, number[]>;
       payload: Record<string, unknown>;
     }> = [];
 
     for (let i = 0; i < chunks.length; i++) {
-      const chunk    = chunks[i]!;
-      const id       = chunkIds[i]!;
-      const codeVec  = codeEmbeds[i];
+      const chunk = chunks[i]!;
+      const id = chunkIds[i]!;
+      const codeVec = codeEmbeds[i];
 
       // All chunks get code_vector at index time. Description text and
       // description_vector are populated later by runDescriptionDrainer().
@@ -764,26 +948,28 @@ export class CodeIndexer {
       // Skip if we have no vectors at all
       if (Object.keys(vector).length === 0) continue;
 
-      const parentId   = chunk.parentKey ? parentKeyToId.get(chunk.parentKey) : undefined;
+      const parentId = chunk.parentKey
+        ? parentKeyToId.get(chunk.parentKey)
+        : undefined;
       const childrenIds = parentToChildren.get(id);
 
       const payload: Record<string, unknown> = {
-        content:    chunk.content,
-        file_path:  relPath,
+        content: chunk.content,
+        file_path: relPath,
         chunk_type: chunk.chunkType,
-        name:       chunk.name,
-        signature:  chunk.signature,
+        name: chunk.name,
+        signature: chunk.signature,
         start_line: chunk.startLine,
-        end_line:   chunk.endLine,
-        language:   chunk.language,
-        jsdoc:      chunk.jsdoc,
+        end_line: chunk.endLine,
+        language: chunk.language,
+        jsdoc: chunk.jsdoc,
         project_id: this.projectId,
-        file_hash:  newHash,
+        file_hash: newHash,
       };
 
-      if (isParent)      payload["is_parent"]     = true;
-      if (parentId)      payload["parent_id"]     = parentId;
-      if (childrenIds)   payload["children_ids"]  = childrenIds;
+      if (isParent) payload["is_parent"] = true;
+      if (parentId) payload["parent_id"] = parentId;
+      if (childrenIds) payload["children_ids"] = childrenIds;
       if (resolvedImports.length > 0) payload["imports"] = resolvedImports;
       payload["branches"] = [this._branch];
 
@@ -791,7 +977,10 @@ export class CodeIndexer {
     }
 
     if (points.length === 0) return [0, 0];
-    await _retryTransient(() => qd.upsert(this.collection, { points }), `qd.upsert ${relPath}`);
+    await _retryTransient(
+      () => qd.upsert(this.collection, { points }),
+      `qd.upsert ${relPath}`,
+    );
     return [points.length, Date.now() - t0];
   }
 
@@ -808,7 +997,8 @@ export class CodeIndexer {
     // relative to project root, and tsconfig.json is found in the right place
     this.resolver = new ImportResolver({ root: pathBase });
     const files = this.collectFiles(root);
-    if (!suppressCountLog) process.stderr.write(`[indexer] Found ${files.length} files\n`);
+    if (!suppressCountLog)
+      process.stderr.write(`[indexer] Found ${files.length} files\n`);
 
     let total = 0;
     for (let i = 0; i < files.length; i++) {
@@ -820,15 +1010,21 @@ export class CodeIndexer {
       total += n;
       onProgress?.(i + 1, files.length, n);
       if ((i + 1) % 20 === 0) {
-        process.stderr.write(`[indexer] [${i + 1}/${files.length}] ${total} chunks\n`);
+        process.stderr.write(
+          `[indexer] [${i + 1}/${files.length}] ${total} chunks\n`,
+        );
       }
-      process.stderr.write(`[indexer] [${i + 1}/${files.length}] ${total} chunks: ${file} done.\n`)
+      process.stderr.write(
+        `[indexer] [${i + 1}/${files.length}] ${total} chunks: ${file} done.\n`,
+      );
     }
 
     // Invalidate cached project overview since structure may have changed
     await invalidateProjectOverview(this.projectId).catch(() => undefined);
 
-    process.stderr.write(`[indexer] Done: ${files.length} files, ${total} chunks\n`);
+    process.stderr.write(
+      `[indexer] Done: ${files.length} files, ${total} chunks\n`,
+    );
 
     // Hint V8 to compact heap after bulk indexing (requires --expose-gc)
     if (typeof globalThis.gc === "function") globalThis.gc();
@@ -841,36 +1037,46 @@ export class CodeIndexer {
   async repairNames(root: string): Promise<void> {
     const pathBase = this.projectRoot ? resolve(this.projectRoot) : root;
     const affected: Array<{
-      id: string; filePath: string; startLine: number; chunkType: string; content: string;
+      id: string;
+      filePath: string;
+      startLine: number;
+      chunkType: string;
+      content: string;
     }> = [];
     let offset: string | number | undefined;
 
     // 1. Collect all empty-name chunks for this project
     while (true) {
-      const result = await qd.scroll(this.collection, {
-        filter: {
-          must: [
-            { key: "project_id", match: { value: this.projectId } },
-            { key: "name",       match: { value: ""             } },
-          ],
-        },
-        limit:        500,
-        with_payload: ["file_path", "start_line", "chunk_type", "content"],
-        with_vector:  false,
-        ...(offset !== undefined && { offset }),
-      }).catch((): { points: []; next_page_offset: undefined } => ({ points: [], next_page_offset: undefined }));
+      const result = await qd
+        .scroll(this.collection, {
+          filter: {
+            must: [
+              { key: "project_id", match: { value: this.projectId } },
+              { key: "name", match: { value: "" } },
+            ],
+          },
+          limit: 500,
+          with_payload: ["file_path", "start_line", "chunk_type", "content"],
+          with_vector: false,
+          ...(offset !== undefined && { offset }),
+        })
+        .catch((): { points: []; next_page_offset: undefined } => ({
+          points: [],
+          next_page_offset: undefined,
+        }));
 
       for (const p of result.points) {
         const pl = (p.payload ?? {}) as Record<string, unknown>;
         affected.push({
-          id:        String(p.id),
-          filePath:  String(pl["file_path"]  ?? ""),
+          id: String(p.id),
+          filePath: String(pl["file_path"] ?? ""),
           startLine: Number(pl["start_line"] ?? 0),
           chunkType: String(pl["chunk_type"] ?? ""),
-          content:   String(pl["content"]    ?? ""),
+          content: String(pl["content"] ?? ""),
         });
       }
-      const next = (result as { next_page_offset?: string | number | null }).next_page_offset;
+      const next = (result as { next_page_offset?: string | number | null })
+        .next_page_offset;
       if (!next) break;
       offset = next;
     }
@@ -880,7 +1086,9 @@ export class CodeIndexer {
       return;
     }
     const fileCount = new Set(affected.map((a) => a.filePath)).size;
-    process.stderr.write(`[repair] ${affected.length} unnamed chunks across ${fileCount} files\n`);
+    process.stderr.write(
+      `[repair] ${affected.length} unnamed chunks across ${fileCount} files\n`,
+    );
 
     // Build alternate bases from includePaths (fallback for path-root mismatches)
     const altBases: string[] = [];
@@ -891,7 +1099,9 @@ export class CodeIndexer {
         try {
           const s = await lstat(abs);
           if (s.isDirectory()) altBases.push(abs);
-        } catch { /* skip */ }
+        } catch {
+          /* skip */
+        }
       }
     }
 
@@ -904,7 +1114,11 @@ export class CodeIndexer {
     }
 
     // 3. Re-parse each file and patch payload only (vectors/descriptions untouched)
-    let fixed = 0, stillEmpty = 0, unfound = 0, skippedChunks = 0, skippedFiles = 0;
+    let fixed = 0,
+      stillEmpty = 0,
+      unfound = 0,
+      skippedChunks = 0,
+      skippedFiles = 0;
     for (const [relPath, points] of byFile) {
       // Try primary base, then each altBase
       let source: string | undefined;
@@ -917,7 +1131,9 @@ export class CodeIndexer {
             source = readFileSync(join(base, relPath), "utf8");
             resolvedBase = base;
             break;
-          } catch { /* try next */ }
+          } catch {
+            /* try next */
+          }
         }
       }
       if (source === undefined) {
@@ -928,14 +1144,19 @@ export class CodeIndexer {
       }
 
       // Re-parse relative to the base that found the file
-      const effectiveRelPath = relative(pathBase, join(resolvedBase, relPath)).replace(/\\/g, "/");
-      const chunks = await parseFile(effectiveRelPath, source).catch(() => [] as CodeChunk[]);
+      const effectiveRelPath = relative(
+        pathBase,
+        join(resolvedBase, relPath),
+      ).replace(/\\/g, "/");
+      const chunks = await parseFile(effectiveRelPath, source).catch(
+        () => [] as CodeChunk[],
+      );
 
       // Primary key: chunkType:startLine (exact match)
       // Fallback key: content (handles line-shift when file modified since indexing)
-      const allKeysFound  = new Set<string>();
-      const chunkMap      = new Map<string, string>(); // chunkType:startLine → name
-      const contentMap    = new Map<string, string>(); // content → name
+      const allKeysFound = new Set<string>();
+      const chunkMap = new Map<string, string>(); // chunkType:startLine → name
+      const contentMap = new Map<string, string>(); // content → name
 
       for (const c of chunks) {
         const key = `${c.chunkType}:${c.startLine}`;
@@ -948,24 +1169,41 @@ export class CodeIndexer {
       }
 
       for (const p of points) {
-        const name = chunkMap.get(`${p.chunkType}:${p.startLine}`) ?? contentMap.get(p.content);
+        const name =
+          chunkMap.get(`${p.chunkType}:${p.startLine}`) ??
+          contentMap.get(p.content);
         if (!name) {
-          const found = allKeysFound.has(`${p.chunkType}:${p.startLine}`) || allKeysFound.has(p.content);
-          if (found) stillEmpty++; else unfound++;
+          const found =
+            allKeysFound.has(`${p.chunkType}:${p.startLine}`) ||
+            allKeysFound.has(p.content);
+          if (found) stillEmpty++;
+          else unfound++;
           continue;
         }
-        await qd.setPayload(this.collection, { payload: { name }, points: [p.id], wait: true } as never);
+        await qd.setPayload(this.collection, {
+          payload: { name },
+          points: [p.id],
+          wait: true,
+        } as never);
         fixed++;
       }
     }
 
-    process.stderr.write(`[repair] Done: ${fixed}/${affected.length} chunks repaired\n`);
+    process.stderr.write(
+      `[repair] Done: ${fixed}/${affected.length} chunks repaired\n`,
+    );
     if (skippedChunks > 0)
-      process.stderr.write(`[repair] ${skippedChunks} chunks in ${skippedFiles} files could not be read (path not found)\n`);
+      process.stderr.write(
+        `[repair] ${skippedChunks} chunks in ${skippedFiles} files could not be read (path not found)\n`,
+      );
     if (stillEmpty > 0)
-      process.stderr.write(`[repair] ${stillEmpty} chunks still have no parseable name (parser fix needed)\n`);
+      process.stderr.write(
+        `[repair] ${stillEmpty} chunks still have no parseable name (parser fix needed)\n`,
+      );
     if (unfound > 0)
-      process.stderr.write(`[repair] ${unfound} chunks could not be matched — run 'local-rag index <root>' to fully re-index those files.\n`);
+      process.stderr.write(
+        `[repair] ${unfound} chunks could not be matched — run 'local-rag index <root>' to fully re-index those files.\n`,
+      );
   }
 
   /**
@@ -978,23 +1216,24 @@ export class CodeIndexer {
 
     let offset: string | number | undefined;
     let migrated = 0;
-    let skipped  = 0;
+    let skipped = 0;
 
     while (true) {
-      const result = await qd.scroll(this.collection, {
-        filter: {
-          must: [
-            { key: "project_id", match: { value: this.projectId } },
-          ],
-          must_not: [
-            { key: "branches", match: { value: branch } },
-          ],
-        },
-        limit:        500,
-        with_payload: ["chunk_type", "file_path", "file_hash"],
-        with_vector:  false,
-        ...(offset !== undefined && { offset }),
-      }).catch((): { points: []; next_page_offset: undefined } => ({ points: [], next_page_offset: undefined }));
+      const result = await qd
+        .scroll(this.collection, {
+          filter: {
+            must: [{ key: "project_id", match: { value: this.projectId } }],
+            must_not: [{ key: "branches", match: { value: branch } }],
+          },
+          limit: 500,
+          with_payload: ["chunk_type", "file_path", "file_hash"],
+          with_vector: false,
+          ...(offset !== undefined && { offset }),
+        })
+        .catch((): { points: []; next_page_offset: undefined } => ({
+          points: [],
+          next_page_offset: undefined,
+        }));
 
       // Only tag chunks whose file exists on disk with matching hash
       const ids: string[] = [];
@@ -1005,8 +1244,18 @@ export class CodeIndexer {
 
         const filePath = String(pl["file_path"] ?? "");
         const fileHash = String(pl["file_hash"] ?? "");
-        if (!filePath || !diskFiles.has(filePath)) { skipped++; continue; }
-        if (fileHash && diskManifest[filePath] && fileHash !== diskManifest[filePath]) { skipped++; continue; }
+        if (!filePath || !diskFiles.has(filePath)) {
+          skipped++;
+          continue;
+        }
+        if (
+          fileHash &&
+          diskManifest[filePath] &&
+          fileHash !== diskManifest[filePath]
+        ) {
+          skipped++;
+          continue;
+        }
 
         ids.push(String(p.id));
       }
@@ -1020,13 +1269,16 @@ export class CodeIndexer {
         migrated += ids.length;
       }
 
-      const next = (result as { next_page_offset?: string | number | null }).next_page_offset;
+      const next = (result as { next_page_offset?: string | number | null })
+        .next_page_offset;
       if (!next) break;
       offset = next;
     }
 
     if (migrated > 0 || skipped > 0) {
-      process.stderr.write(`[indexer] Migration: tagged ${migrated} chunks with branch "${branch}", skipped ${skipped}\n`);
+      process.stderr.write(
+        `[indexer] Migration: tagged ${migrated} chunks with branch "${branch}", skipped ${skipped}\n`,
+      );
     }
   }
 
@@ -1043,22 +1295,34 @@ export class CodeIndexer {
     let offset: string | number | undefined;
 
     while (true) {
-      const result = await qd.scroll(this.collection, {
-        filter: { must: [{ key: "project_id", match: { value: this.projectId } }] },
-        limit:        500,
-        with_payload: ["branches", "chunk_type"],
-        with_vector:  false,
-        ...(offset !== undefined && { offset }),
-      }).catch((): { points: []; next_page_offset: undefined } => ({ points: [], next_page_offset: undefined }));
+      const result = await qd
+        .scroll(this.collection, {
+          filter: {
+            must: [{ key: "project_id", match: { value: this.projectId } }],
+          },
+          limit: 500,
+          with_payload: ["branches", "chunk_type"],
+          with_vector: false,
+          ...(offset !== undefined && { offset }),
+        })
+        .catch((): { points: []; next_page_offset: undefined } => ({
+          points: [],
+          next_page_offset: undefined,
+        }));
 
       for (const p of result.points) {
         const pl = (p.payload ?? {}) as Record<string, unknown>;
-        if (pl["chunk_type"] === "git_state" || pl["chunk_type"] === "branch_manifest") continue;
-        const branches = pl["branches"] as string[] | undefined ?? [];
+        if (
+          pl["chunk_type"] === "git_state" ||
+          pl["chunk_type"] === "branch_manifest"
+        )
+          continue;
+        const branches = (pl["branches"] as string[] | undefined) ?? [];
         for (const b of branches) allBranches.add(b);
       }
 
-      const next = (result as { next_page_offset?: string | number | null }).next_page_offset;
+      const next = (result as { next_page_offset?: string | number | null })
+        .next_page_offset;
       if (!next) break;
       offset = next;
     }
@@ -1069,7 +1333,9 @@ export class CodeIndexer {
       return;
     }
 
-    process.stderr.write(`[gc] Cleaning up ${staleBranches.length} stale branch(es): ${staleBranches.join(", ")}\n`);
+    process.stderr.write(
+      `[gc] Cleaning up ${staleBranches.length} stale branch(es): ${staleBranches.join(", ")}\n`,
+    );
 
     // For each stale branch: remove it from chunks' branches[], delete manifests
     for (const branch of staleBranches) {
@@ -1077,21 +1343,28 @@ export class CodeIndexer {
       let cleaned = 0;
 
       while (true) {
-        const result = await qd.scroll(this.collection, {
-          filter: {
-            must: [
-              { key: "project_id", match: { value: this.projectId } },
-              { key: "branches",   match: { value: branch        } },
-            ],
-          },
-          limit:        500,
-          with_payload: ["branches"],
-          with_vector:  false,
-          ...(gcOffset !== undefined && { offset: gcOffset }),
-        }).catch((): { points: []; next_page_offset: undefined } => ({ points: [], next_page_offset: undefined }));
+        const result = await qd
+          .scroll(this.collection, {
+            filter: {
+              must: [
+                { key: "project_id", match: { value: this.projectId } },
+                { key: "branches", match: { value: branch } },
+              ],
+            },
+            limit: 500,
+            with_payload: ["branches"],
+            with_vector: false,
+            ...(gcOffset !== undefined && { offset: gcOffset }),
+          })
+          .catch((): { points: []; next_page_offset: undefined } => ({
+            points: [],
+            next_page_offset: undefined,
+          }));
 
         for (const p of result.points) {
-          const old = ((p.payload ?? {}) as Record<string, unknown>)["branches"] as string[] | undefined ?? [];
+          const old =
+            (((p.payload ?? {}) as Record<string, unknown>)["branches"] as
+              string[] | undefined) ?? [];
           const updated = old.filter((b) => b !== branch);
           if (updated.length === 0) {
             await qd.delete(this.collection, { points: [String(p.id)] });
@@ -1105,19 +1378,24 @@ export class CodeIndexer {
           cleaned++;
         }
 
-        const next = (result as { next_page_offset?: string | number | null }).next_page_offset;
+        const next = (result as { next_page_offset?: string | number | null })
+          .next_page_offset;
         if (!next) break;
         gcOffset = next;
       }
 
       await deleteManifest(branch).catch(() => undefined);
-      process.stderr.write(`[gc] Branch "${branch}": cleaned ${cleaned} chunks\n`);
+      process.stderr.write(
+        `[gc] Branch "${branch}": cleaned ${cleaned} chunks\n`,
+      );
     }
   }
 
   async clear(): Promise<void> {
     await qd.delete(this.collection, {
-      filter: { must: [{ key: "project_id", match: { value: this.projectId } }] },
+      filter: {
+        must: [{ key: "project_id", match: { value: this.projectId } }],
+      },
     });
     process.stderr.write("[indexer] Index cleared\n");
   }
@@ -1125,7 +1403,7 @@ export class CodeIndexer {
   async stats(): Promise<void> {
     const info = await qd.getCollection(this.collection);
     process.stdout.write(
-      `Code Index: ${info.points_count ?? 0} points, ${info.segments_count ?? 0} segments\n`
+      `Code Index: ${info.points_count ?? 0} points, ${info.segments_count ?? 0} segments\n`,
     );
   }
 }
@@ -1138,7 +1416,7 @@ function hashSource(source: string): string {
 
 function buildEmbedContext(c: CodeChunk): string {
   let ctx = `File: ${c.filePath}\nType: ${c.chunkType}\nName: ${c.name}\n`;
-  if (c.jsdoc)     ctx += `JSDoc: ${c.jsdoc}\n`;
+  if (c.jsdoc) ctx += `JSDoc: ${c.jsdoc}\n`;
   if (c.signature) ctx += `Sig: ${c.signature}\n`;
   ctx += `Code:\n${c.content}`;
   return ctx.slice(0, 4000);

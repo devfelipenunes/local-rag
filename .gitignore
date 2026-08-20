@@ -8,3 +8,6 @@ src/dashboard-ui/.angular/
 types/
 .memory.json
 .worktrees/
+
+# Corpos de PRs p/ repo de terceiros — não publicar
+PR-BODIES.md
